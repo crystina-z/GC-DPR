@@ -112,8 +112,14 @@ class BiEncoderTrainer(object):
 
     def get_data_iterator(self, path: str, batch_size: int, shuffle=True,
                           shuffle_seed: int = 0,
-                          offset: int = 0, upsample_rates: list = None) -> ShardedDataIterator:
+                          offset: int = 0, upsample_rates: list = None,
+                          exclude_str: str = "") -> ShardedDataIterator:
         data_files = glob.glob(path)
+        data_files = [fn for fn in data_files if exclude_str not in fn]
+        print("*" * 50)
+        print("Number of dev files", len(data_files))
+        print("*" * 50)
+
         data = read_data_from_json_files(data_files, upsample_rates)
 
         # filter those without positive ctx
@@ -129,8 +135,14 @@ class BiEncoderTrainer(object):
     def get_data_iterable(self, path: str, batch_size: int, shuffle=True,
                           shuffle_seed: int = 0,
                           offset: int = 0, upsample_rates: list = None,
-                          process_fn: Callable = None) -> ShardedDataIterator:
+                          process_fn: Callable = None, 
+                          exclude_str: str = "") -> ShardedDataIterator:
         data_files = glob.glob(path)
+        data_files = [fn for fn in data_files if exclude_str not in fn]
+        print("*" * 50)
+        print("Number of train files", len(data_files))
+        print("*" * 50)
+
         data = read_data_from_json_files(data_files, upsample_rates)
 
         # filter those without positive ctx
@@ -162,7 +174,9 @@ class BiEncoderTrainer(object):
             process_fn=process_fn,
             shuffle=True,
             shuffle_seed=args.seed, offset=self.start_batch,
-            upsample_rates=upsample_rates)
+            upsample_rates=upsample_rates,
+            exclude_str=args.exclude_str
+        )
 
         logger.info("  Total iterations per epoch=%d", train_iterable.max_iterations)
         updates_per_epoch = train_iterable.max_iterations // args.gradient_accumulation_steps
@@ -213,7 +227,10 @@ class BiEncoderTrainer(object):
         logger.info('NLL validation ...')
         args = self.args
         self.biencoder.eval()
-        data_iterator = self.get_data_iterator(args.dev_file, args.dev_batch_size, shuffle=False)
+        data_iterator = self.get_data_iterator(
+            args.dev_file, args.dev_batch_size, shuffle=False,
+            exclude_str=args.exclude_str
+        )
 
         total_loss = 0.0
         start_time = time.time()
