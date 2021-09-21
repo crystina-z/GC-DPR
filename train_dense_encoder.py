@@ -28,6 +28,7 @@ from torch import Tensor as T
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.checkpoint import get_device_states, set_device_states
 from torch.utils.data import IterableDataset, DataLoader
+import matplotlib.pyplot as plt
 
 from dpr.models import init_biencoder_components
 from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch
@@ -190,16 +191,22 @@ class BiEncoderTrainer(object):
             logger.info("Loading scheduler state %s", self.scheduler_state)
             scheduler.load_state_dict(self.scheduler_state)
 
+        all_validation_losses = []
         eval_step = math.ceil(updates_per_epoch / args.eval_per_epoch)
         logger.info("  Eval step = %d", eval_step)
         logger.info("***** Training *****")
 
         for epoch in range(self.start_epoch, int(args.num_train_epochs)):
             logger.info("***** Epoch %d *****", epoch)
-            self._train_epoch(scheduler, epoch, eval_step, train_iterable)
+            validation_losses = self._train_epoch(scheduler, epoch, eval_step, train_iterable)
+            all_validation_losses.extend(validation_losses)
 
         if args.local_rank in [-1, 0]:
             logger.info('Training finished. Best validation checkpoint %s', self.best_cp_name)
+
+        plt.plot(list(range(len(all_validation_losses))), all_validation_losses, label="Loss")
+        plt.savefig(os.path.join(args.output_dir, "all-validation-loss.png"))
+
 
     def validate_and_save(self, epoch: int, iteration: int, scheduler):
         args = self.args
@@ -222,6 +229,7 @@ class BiEncoderTrainer(object):
                 self.best_validation_result = validation_loss
                 self.best_cp_name = cp_name
                 logger.info('New Best validation checkpoint %s', cp_name)
+        return validation_loss
 
     def validate_nll(self) -> float:
         logger.info('NLL validation ...')
@@ -391,6 +399,7 @@ class BiEncoderTrainer(object):
         self.biencoder.train()
         epoch_batches = train_data_iterator.max_iterations
         data_iteration = 0
+        validation_losses = []
 
         train_data_iterator.set_epoch(epoch=epoch)
         start_iteration = train_data_iterator.get_iteration() + 1
@@ -444,14 +453,19 @@ class BiEncoderTrainer(object):
 
             if data_iteration % eval_step == 0:
                 logger.info('Validation: Epoch: %d Step: %d/%d', epoch, data_iteration, epoch_batches)
-                self.validate_and_save(epoch, i + start_iteration, scheduler)
+                validation_loss = self.validate_and_save(epoch, i + start_iteration, scheduler)
+                validation_losses.append(validation_loss)
                 self.biencoder.train()
 
-        self.validate_and_save(epoch, data_iteration, scheduler)
+        validation_loss = self.validate_and_save(epoch, data_iteration, scheduler)
+        validation_losses.append(validation_loss)
+        logger.info(f'All validation losses: {validation_losses}')
 
         epoch_loss = (epoch_loss / epoch_batches) if epoch_batches > 0 else 0
         logger.info('Av Loss per epoch=%f', epoch_loss)
         logger.info('epoch total correct predictions=%d', epoch_correct_predictions)
+        return validation_losses
+
 
     def _save_checkpoint(self, scheduler, epoch: int, offset: int) -> str:
         args = self.args
