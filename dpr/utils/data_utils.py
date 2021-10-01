@@ -46,7 +46,10 @@ def read_data_from_json_files(paths: List[str], upsample_rates: List = None) -> 
     for i, path in enumerate(paths):
         with open(path, 'r', encoding="utf-8") as f:
             logger.info('Reading file %s' % path)
-            data = json.load(f)
+            if path.endswith(".json"):
+                data = json.load(f)
+            elif path.endswith(".jsonl"):
+                data = [json.loads(line) for line in f]
             upsample_factor = int(upsample_rates[i])
             data = data * upsample_factor
             results.extend(data)
