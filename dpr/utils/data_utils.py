@@ -16,12 +16,64 @@ import math
 import os
 import pickle
 import random
-from typing import List, Iterator, Callable
+from typing import List, Dict, Iterator, Callable, Union
 
 from torch import Tensor as T
 from torch.utils.data import IterableDataset
 
 logger = logging.getLogger()
+
+
+def get_data_size(data):
+    assert isinstance(data, list)
+    assert all(isinstance(d, dict) for d in data)
+    if all(set(d.keys()) == {"meta", "data"} for d in data):
+        # assume each data entry has format {"meta": meta, "data": data}
+        return sum(len(sample["data"]) for sample in data)
+    else:
+        return len(data)
+
+
+def remove_data_wo_pos_ctx(data):
+    assert isinstance(data, list)
+    # if all(isinstance(d, dict) for d in data) and set(data) == {"meta", "data"}:
+    assert all(isinstance(d, dict) for d in data)
+    if all(set(d.keys()) == {"meta", "data"} for d in data):
+        # assume each data entry has format {"meta": meta, "data": data}
+        # return sum(len(sample["data"]) for sample in data)
+        # return [r for r in data if len(r['data']['positive_ctxs']) > 0]
+        cleaned = [{
+            "meta": meta_data["meta"],
+            "data": [r for r in meta_data["data"] if len(r['positive_ctxs']) > 0]
+        } for meta_data in data]
+    else:
+        cleaned = [r for r in data if len(r['positive_ctxs']) > 0]
+
+    data_size = get_data_size(cleaned)
+    logger.info('Total cleaned data size: {}'.format(data_size))
+    return cleaned
+
+
+def load_data_from_json(json_f, aggregated, upsample_factor: int = 1) -> List:
+    data = json.load(json_f)
+    if isinstance(data, list):
+        data = data * upsample_factor
+        aggregated.extend(data)
+    elif isinstance(data, dict):
+        assert set(data) == {"meta", "data"}, "The loaded dict should contain both 'meta' and 'data' field"
+        meta = data["meta"]
+        data = data["data"]
+        print("meta", type(meta), "data: ", type(data), flush=True)
+        assert isinstance(meta, dict) and isinstance(data, list)
+        data = data * upsample_factor
+        aggregated.append({"meta": meta, "data": data})
+    else:
+        raise ValueError(
+            "Unexpected data type, should be either a list of data or a dict containing 'meta' and 'data' fields"
+        )
+    data_size = get_data_size(aggregated)
+    logger.info('Aggregated data size: {}'.format(data_size))
+    return aggregated
 
 
 def read_serialized_data_from_files(paths: List[str]) -> List:
@@ -36,7 +88,7 @@ def read_serialized_data_from_files(paths: List[str]) -> List:
     return results
 
 
-def read_data_from_json_files(paths: List[str], upsample_rates: List = None) -> List:
+def read_data_from_json_files(paths: List[str], upsample_rates: List = None) -> Union[List, Dict]:
     results = []
     if upsample_rates is None:
         upsample_rates = [1] * len(paths)
@@ -46,14 +98,17 @@ def read_data_from_json_files(paths: List[str], upsample_rates: List = None) -> 
     for i, path in enumerate(paths):
         with open(path, 'r', encoding="utf-8") as f:
             logger.info('Reading file %s' % path)
-            if path.endswith(".json"):
-                data = json.load(f)
-            elif path.endswith(".jsonl"):
-                data = [json.loads(line) for line in f]
+            assert path.endswith(".json")
             upsample_factor = int(upsample_rates[i])
-            data = data * upsample_factor
-            results.extend(data)
-            logger.info('Aggregated data size: {}'.format(len(results)))
+            load_data_from_json(
+                json_f=f,
+                aggregated=results,
+                upsample_factor=upsample_factor,
+            )  # update results internally
+            # data = json.load(f)
+            # data = data * upsample_factor
+            # results.extend(data)
+            # logger.info('Aggregated data size: {}'.format(len(results)))
     return results
 
 
@@ -66,22 +121,35 @@ class ShardedDataIterator(object):
     It can also optionally enforce identical batch size for all iterations (might be useful for DP mode).
     """
 
+    @staticmethod
+    def group_data(data):
+        """ we only consider lang in the group key now """
+        assert isinstance(data, list)
+        assert all(isinstance(d, dict) for d in data)
+        if all(set(d.keys()) == {"meta", "data"} for d in data):
+            assert all("lang" in d["meta"] for d in data)
+            data = {d["meta"]["lang"]: d["data"] for d in data}
+        else:
+            # if each entry in the list is of key {"question": ..., {"answers": ...}}, then it does not have meta info
+            data = {"combined": data}
+        return data
+
     def __init__(self, data: list, shard_id: int = 0, num_shards: int = 1, batch_size: int = 1, shuffle=True,
                  shuffle_seed: int = 0, offset: int = 0,
                  strict_batch_size: bool = False
                  ):
 
+        data = self.group_data(data)
         self.data = data
-        total_size = len(data)
+        # total_size = len(data)
 
         self.shards_num = max(num_shards, 1)
         self.shard_id = max(shard_id, 0)
-
-        samples_per_shard = math.ceil(total_size / self.shards_num)
-
-        self.shard_start_idx = self.shard_id * samples_per_shard
-
-        self.shard_end_idx = min(self.shard_start_idx + samples_per_shard, total_size)
+        _, samples_per_shard = self.init_data_per_shard()
+        self.samples_per_shard = samples_per_shard
+        # samples_per_shard = math.ceil(self.total_size / self.shards_num)
+        # self.shard_start_idx = self.shard_id * samples_per_shard
+        # self.shard_end_idx = min(self.shard_start_idx + samples_per_shard, self.total_size)
 
         if strict_batch_size:
             self.max_iterations = math.ceil(samples_per_shard / batch_size)
@@ -89,10 +157,10 @@ class ShardedDataIterator(object):
             self.max_iterations = int(samples_per_shard / batch_size)
 
         logger.debug(
-            'samples_per_shard=%d, shard_start_idx=%d, shard_end_idx=%d, max_iterations=%d', samples_per_shard,
-            self.shard_start_idx,
-            self.shard_end_idx,
-            self.max_iterations)
+            # 'samples_per_shard=%d, shard_start_idx=%d, shard_end_idx=%d, max_iterations=%d', total_samples_per_shard,
+            # self.shard_start_idx,
+            # self.shard_end_idx,
+            'samples_per_shard=%d, max_iterations=%d', samples_per_shard, self.max_iterations)
 
         self.iteration = offset  # to track in-shard iteration status
         self.shuffle = shuffle
@@ -100,25 +168,64 @@ class ShardedDataIterator(object):
         self.shuffle_seed = shuffle_seed
         self.strict_batch_size = strict_batch_size
 
-    def total_data_len(self) -> int:
-        return len(self.data)
+    @property
+    def total_size(self):
+        if not hasattr(self, "_total_size"):
+            assert hasattr(self, "data")
+            self._total_size = sum(len(data_sample) for data_sample in self.data.values())
+        return self._total_size
+
+    def init_data_per_shard(self):
+        """
+        Assume that this function is called after the data has been grouped
+        return: total_data_size, total_data_size_per_shard
+        """
+        self.sample_size = {g_name: len(self.data[g_name]) for g_name in self.data}
+        self.shard_samples_num = {g_name: math.ceil(self.sample_size[g_name] / self.shards_num) for g_name in self.data}
+        self.shard_start_idx = {g_name: self.shard_id * self.shard_samples_num[g_name] for g_name in self.data}
+        self.shard_end_idx = {g_name: min(
+            self.shard_start_idx[g_name] + self.shard_samples_num[g_name],
+            self.sample_size[g_name]
+        ) for g_name in self.data}
+        return map(lambda dct: sum(dct.values()), [self.sample_size, self.shard_samples_num])
+
+    def get_batch(self, batch_idx, g_name):
+        """return a batch of data from the same group"""
+        start_idx = self.shard_start_idx[g_name]
+        end_idx = self.shard_end_idx[g_name]
+        shard_samples = self.data[g_name][start_idx:end_idx]
+        items = shard_samples[batch_idx:batch_idx + self.batch_size]
+        if self.strict_batch_size and len(items) < self.batch_size:
+            logger.debug('Extending batch to max size')
+            items.extend(shard_samples[0:self.batch_size - len(items)])
+        return items
+
+    def next_group_name(self):
+        """Infinite loop that always yield next group to check"""
+        while True:
+            for g_name in self.data:
+                yield g_name
+
+    def shuffle_data(self, rnd):
+        """shuffle data within each group"""
+        for g_name in self.data:
+            rnd.shuffle(self.data[g_name])
 
     def iterate_data(self, epoch: int = 0) -> Iterator[List]:
         if self.shuffle:
             # to be able to resume, same shuffling should be used when starting from a failed/stopped iteration
             epoch_rnd = random.Random(self.shuffle_seed + epoch)
-            epoch_rnd.shuffle(self.data)
+            # epoch_rnd.shuffle(self.data)
+            self.shuffle_data(epoch_rnd)
 
         # if resuming iteration somewhere in the middle of epoch, one needs to adjust max_iterations
-
         max_iterations = self.max_iterations - self.iteration
+        group_name_iter = self.next_group_name()
 
-        shard_samples = self.data[self.shard_start_idx:self.shard_end_idx]
-        for i in range(self.iteration * self.batch_size, len(shard_samples), self.batch_size):
-            items = shard_samples[i:i + self.batch_size]
-            if self.strict_batch_size and len(items) < self.batch_size:
-                logger.debug('Extending batch to max size')
-                items.extend(shard_samples[0:self.batch_size - len(items)])
+        for i in range(self.iteration * self.batch_size, self.samples_per_shard, self.batch_size):
+            # for g_name in self.data:
+            g_name = next(group_name_iter)
+            items = self.get_batch(batch_idx=i, g_name=g_name)
             self.iteration += 1
             yield items
 
@@ -126,8 +233,11 @@ class ShardedDataIterator(object):
         while self.iteration < max_iterations:
             logger.debug('Fulfilling non complete shard='.format(self.shard_id))
             self.iteration += 1
-            batch = shard_samples[0:self.batch_size]
-            yield batch
+            g_name = next(group_name_iter)
+            items = self.get_batch(batch_idx=0, g_name=g_name)
+            yield items
+            # batch = shard_samples[0:self.batch_size]
+            # yield batch
 
         logger.debug('Finished iterating, iteration={}, shard={}'.format(self.iteration, self.shard_id))
         # reset the iteration status
@@ -137,8 +247,9 @@ class ShardedDataIterator(object):
         return self.iteration
 
     def apply(self, visitor_func: Callable):
-        for sample in self.data:
-            visitor_func(sample)
+        for g_name in self.data:
+            for sample in self.data[g_name]:
+                visitor_func(sample)
 
 
 class ShardedDataIterableDataset(ShardedDataIterator, IterableDataset):
@@ -160,25 +271,38 @@ class ShardedDataIterableDataset(ShardedDataIterator, IterableDataset):
         if self.shuffle:
             # to be able to resume, same shuffling should be used when starting from a failed/stopped iteration
             epoch_rnd = random.Random(self.shuffle_seed + self.epoch)
-            epoch_rnd.shuffle(self.data)
+            # epoch_rnd.shuffle(self.data)
+            self.shuffle_data(epoch_rnd)
 
         # if resuming iteration somewhere in the middle of epoch, one needs to adjust max_iterations
         self._max_iterations = self.max_iterations - self.iteration
-        self.shard_samples = self.data[self.shard_start_idx:self.shard_end_idx]
-        self.idx_gen = iter(range(self.iteration * self.batch_size, len(self.shard_samples), self.batch_size))
+        # self.shard_samples = self.data[self.shard_start_idx:self.shard_end_idx]
+        # self.idx_gen = iter(range(self.iteration * self.batch_size, len(self.shard_samples), self.batch_size))
+        self.idx_gen = iter(range(self.iteration * self.batch_size, self.samples_per_shard, self.batch_size))
         self.iteration = 0
         self._ended = False
-
+        self.group_name_iter = self.next_group_name()
         return self
 
     def __next__(self):
         if not self._ended:
             try:
                 i = next(self.idx_gen)
-                items = self.shard_samples[i:i + self.batch_size]
-                if self.strict_batch_size and len(items) < self.batch_size:
-                    logger.debug('Extending batch to max size')
-                    items.extend(self.shard_samples[0:self.batch_size - len(items)])
+                g_name = next(self.group_name_iter)
+                items = self.get_batch(batch_idx=i, g_name=g_name)
+                # items = self.shard_samples[i:i + self.batch_size]
+                # print("id: ", i, "end:", i + self.batch_size, "item sample:", len(items), items)
+                print("id: ", i, "end:", i + self.batch_size, "item sample:", len(items))
+                # seems to pass
+                # for it in items:
+                #     print("\t", it["question"])
+                # print("=" * 100)
+                if self.strict_batch_size:
+                    assert len(items) == self.batch_size
+
+                # if self.strict_batch_size and len(items) < self.batch_size:
+                #     logger.debug('Extending batch to max size')
+                #     items.extend(self.shard_samples[0:self.batch_size - len(items)])
                 self.iteration += 1
                 if self.process_fn:
                     random.seed(self.shuffle_seed + self.epoch + self.iteration)
@@ -191,7 +315,9 @@ class ShardedDataIterableDataset(ShardedDataIterator, IterableDataset):
         if self.iteration < self._max_iterations:
             logger.debug('Fulfilling non complete shard='.format(self.shard_id))
             self.iteration += 1
-            batch = self.shard_samples[0:self.batch_size]
+            # batch = self.shard_samples[0:self.batch_size]
+            g_name = next(self.group_name_iter)
+            batch = self.get_batch(batch_idx=0, g_name=g_name)
             if self.process_fn:
                 random.seed(self.shuffle_seed + self.epoch + self.iteration)
                 return self.process_fn(batch)

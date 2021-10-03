@@ -34,7 +34,8 @@ from dpr.models import init_biencoder_components
 from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch
 from dpr.options import add_encoder_params, add_training_params, setup_args_gpu, set_seed, print_args, \
     get_encoder_params_state, add_tokenizer_params, set_encoder_params_from_state
-from dpr.utils.data_utils import ShardedDataIterator, read_data_from_json_files, Tensorizer, ShardedDataIterableDataset
+from dpr.utils.data_utils import ShardedDataIterator, Tensorizer, ShardedDataIterableDataset, \
+    read_data_from_json_files, remove_data_wo_pos_ctx
 from dpr.utils.dist_utils import all_gather_list
 from dpr.utils.model_utils import setup_for_distributed_mode, move_to_device, get_schedule_linear, CheckpointState, \
     get_model_file, get_model_obj, load_states_from_checkpoint
@@ -124,8 +125,9 @@ class BiEncoderTrainer(object):
         data = read_data_from_json_files(data_files, upsample_rates)
 
         # filter those without positive ctx
-        data = [r for r in data if len(r['positive_ctxs']) > 0]
-        logger.info('Total cleaned data size: {}'.format(len(data)))
+        # data = [r for r in data if len(r['positive_ctxs']) > 0]
+        # logger.info('Total cleaned data size: {}'.format(len(data)))
+        data = remove_data_wo_pos_ctx(data)
 
         return ShardedDataIterator(data, shard_id=self.shard_id,
                                    num_shards=self.distributed_factor,
@@ -147,8 +149,9 @@ class BiEncoderTrainer(object):
         data = read_data_from_json_files(data_files, upsample_rates)
 
         # filter those without positive ctx
-        data = [r for r in data if len(r['positive_ctxs']) > 0]
-        logger.info('Total cleaned data size: {}'.format(len(data)))
+        # data = [r for r in data if len(r['positive_ctxs']) > 0]
+        # logger.info('Total cleaned data size: {}'.format(len(data)))
+        data = remove_data_wo_pos_ctx(data)
 
         return ShardedDataIterableDataset(
             data,
